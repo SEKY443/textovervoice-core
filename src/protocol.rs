@@ -114,6 +114,16 @@ pub const FLAG_MORE_FRAMES: u8 = 0b0000_0010; // message continues in a subseque
 const HEADER_PARITY_BYTES: usize = 4;
 const HEADER_LEN: usize = 6; // DEST_ID(1) + SRC_ID(1) + FLAGS(1) + SEQ(1) + LENGTH(2)
 
+/// RS parity bytes protecting a [`NackFrame`]'s 5-byte header -- same
+/// budget as [`HEADER_PARITY_BYTES`] (t=2 correction), applied to a
+/// slightly shorter block. A resend request is exactly the kind of short,
+/// high-value control message worth protecting at least as well as an
+/// ordinary frame's header: if it can't survive the channel, the receiver
+/// silently gets no resend instead of a clean failure it could retry.
+const NACK_PARITY_BYTES: usize = 4;
+/// DEST_ID(1) + SRC_ID(1) + TARGET_ID(3) -- see [`NackFrame`].
+const NACK_HEADER_LEN: usize = 5;
+
 /// Which wire format [`build_frame`] emits and [`parse_frame`] expects to
 /// auto-detect. See this module's docs for the full rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -205,6 +215,87 @@ impl ParseResult {
             more_frames: None,
         }
     }
+}
+
+/// A resend request: "please retransmit the message identified by
+/// `target_id`". Distinct from an ordinary data frame -- recognized right
+/// after SOF (via [`codes::FEC_SCHEME_ID_HI`], reserved for exactly this:
+/// "a future third frame format") without running dictionary/charset
+/// decode, FEC over a full payload, or CRC -- so a listener can act on it
+/// cheaply and a corrupted one fails obviously rather than being
+/// misinterpreted as a malformed data frame.
+///
+/// `target_id` identifies which message to resend. It's opaque to this
+/// module -- callers are expected to tag every frame of a message they
+/// send with the same 3-byte id (at the payload/text layer, e.g. as a
+/// short prefix), so that any single successfully-decoded frame reveals
+/// which message it belongs to even if other frames of that message were
+/// lost. 3 bytes matches the id size already used for this purpose
+/// elsewhere (see CLI-TextOverVoice's `chat.rs` `random_msg_id`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NackFrame {
+    pub dest_id: u8,
+    pub src_id: u8,
+    pub target_id: [u8; 3],
+}
+
+/// Builds a resend-request frame. Always succeeds -- a 5-byte header can't
+/// overflow anything the way a payload's LENGTH field can.
+pub fn build_nack_frame(nack: &NackFrame) -> Vec<u8> {
+    let header_data = [
+        nack.dest_id,
+        nack.src_id,
+        nack.target_id[0],
+        nack.target_id[1],
+        nack.target_id[2],
+    ];
+    let header_parity = fec::protect(&header_data, NACK_PARITY_BYTES);
+
+    let mut frame = vec![codes::FEC_SOF, codes::FEC_SCHEME_ID_HI];
+    frame.extend(stuff(&header_data));
+    frame.extend(stuff(&header_parity));
+    frame
+}
+
+/// Attempts to read a [`NackFrame`] starting at `received[0]`. Returns
+/// `None` both when `received` isn't a NACK frame at all (wrong dispatch
+/// byte -- most commonly because it's an ordinary data frame instead) and
+/// when it is one but the header proved uncorrectable -- a caller scanning
+/// for resend requests only cares whether a valid one for it arrived, not
+/// why a malformed one didn't parse, unlike [`parse_frame`]'s richer
+/// [`ParseResult`] (built for a human/log-facing "why did this fail").
+pub fn parse_nack_frame(received: &[u8]) -> Option<NackFrame> {
+    let mut reader = TokenReader::new(received);
+    match reader.read().ok()? {
+        Token::Flag(v) if v == codes::FEC_SOF => {}
+        _ => return None,
+    }
+    match reader.read().ok()? {
+        Token::Flag(v) if v == codes::FEC_SCHEME_ID_HI => {}
+        _ => return None,
+    }
+    let header = read_nack_header(&mut reader)?;
+    Some(NackFrame {
+        dest_id: header[0],
+        src_id: header[1],
+        target_id: [header[2], header[3], header[4]],
+    })
+}
+
+/// Shared by [`parse_nack_frame`] and [`frame_wire_length`]'s NACK branch:
+/// reads the header+parity block as logical tokens (same rationale as
+/// [`read_protected_header`] for treating a broken escape-pair structurally
+/// the same as a corrupted data byte) and RS-corrects it.
+fn read_nack_header(reader: &mut TokenReader) -> Option<[u8; NACK_HEADER_LEN]> {
+    let mut header_and_parity = Vec::with_capacity(NACK_HEADER_LEN + NACK_PARITY_BYTES);
+    for _ in 0..(NACK_HEADER_LEN + NACK_PARITY_BYTES) {
+        match reader.read().ok()? {
+            Token::Data(v) | Token::Flag(v) => header_and_parity.push(v),
+        }
+    }
+    let (header_data, header_parity) = header_and_parity.split_at(NACK_HEADER_LEN);
+    let corrected = fec::recover(header_data, header_parity, NACK_PARITY_BYTES)?;
+    corrected.try_into().ok()
 }
 
 /// Options accepted by [`build_frame`]. `seq`/`more_frames` are normally set
@@ -426,6 +517,10 @@ pub fn frame_wire_length(wire: &[u8], start: usize, parity_bytes: usize) -> Opti
         Ok(Token::Flag(v)) if v == codes::FEC_SCHEME_ID_LO => {
             frame_wire_length_protected(&wire[start..], &mut reader, parity_bytes)
                 .map(|len| start + len)
+        }
+        Ok(Token::Flag(v)) if v == codes::FEC_SCHEME_ID_HI => {
+            read_nack_header(&mut reader)?;
+            Some(start + reader.pos())
         }
         _ => {
             reader.set_pos(saved);
@@ -1436,5 +1531,105 @@ mod tests {
         assert!(result.ok, "{result:?}");
         assert_eq!(result.seq, Some(5));
         assert_eq!(result.more_frames, Some(true));
+    }
+
+    // --- NackFrame (resend requests) --------------------------------------
+
+    #[test]
+    fn nack_roundtrip() {
+        let nack = NackFrame {
+            dest_id: 7,
+            src_id: 3,
+            target_id: [0xAB, 0xCD, 0xEF],
+        };
+        let frame = build_nack_frame(&nack);
+        let parsed = parse_nack_frame(&frame).unwrap();
+        assert_eq!(parsed, nack);
+    }
+
+    /// A NACK frame must never be misread as an ordinary data frame (or
+    /// vice versa) -- they share the same SOF but diverge on the very next
+    /// byte ([`codes::FEC_SCHEME_ID_HI`] vs [`codes::FEC_SCHEME_ID_LO`]/
+    /// anything else), so dispatch must route each to its own parser only.
+    #[test]
+    fn nack_frame_is_not_parsed_as_a_data_frame_and_vice_versa() {
+        let nack = build_nack_frame(&NackFrame {
+            dest_id: 1,
+            src_id: 2,
+            target_id: [1, 2, 3],
+        });
+        let data_result = parse_frame(&nack, fec::DEFAULT_PARITY_BYTES, true, None, None);
+        assert!(!data_result.ok);
+
+        let data_frame = build("hello");
+        assert!(parse_nack_frame(&data_frame).is_none());
+    }
+
+    #[test]
+    fn nack_survives_corruption_within_header_fec_budget() {
+        let nack = NackFrame {
+            dest_id: 42,
+            src_id: 99,
+            target_id: [0x11, 0x22, 0x33],
+        };
+        let mut frame = build_nack_frame(&nack);
+        // 2 corrupted bytes, within NACK_PARITY_BYTES=4's t=2 budget --
+        // same margin `protected_header_corrects_corrupted_header_bytes`
+        // exercises for the ordinary header.
+        frame[2] ^= 0xFF;
+        frame[4] ^= 0xFF;
+        let parsed = parse_nack_frame(&frame).unwrap();
+        assert_eq!(parsed, nack);
+    }
+
+    #[test]
+    fn nack_fails_cleanly_beyond_its_correction_budget() {
+        let nack = NackFrame {
+            dest_id: 42,
+            src_id: 99,
+            target_id: [0x11, 0x22, 0x33],
+        };
+        let mut frame = build_nack_frame(&nack);
+        for byte in &mut frame[2..9] {
+            *byte ^= 0xFF;
+        }
+        let parsed = parse_nack_frame(&frame);
+        // Must not silently hand back a wrong target_id as if it were
+        // correct -- either it fails, or it's exactly right.
+        assert!(parsed.is_none() || parsed == Some(nack));
+    }
+
+    #[test]
+    fn nack_frame_wire_length_lets_scanning_find_the_next_frame() {
+        let nack = build_nack_frame(&NackFrame {
+            dest_id: 1,
+            src_id: 2,
+            target_id: [9, 9, 9],
+        });
+        let data = build("second frame");
+        let mut both = nack.clone();
+        both.extend(&data);
+
+        let len1 = frame_wire_length(&both, 0, fec::DEFAULT_PARITY_BYTES).unwrap();
+        assert_eq!(len1, nack.len());
+
+        let result2 = parse_frame(&both[len1..], fec::DEFAULT_PARITY_BYTES, true, None, None);
+        assert!(result2.ok, "{result2:?}");
+        assert_eq!(result2.text.as_deref(), Some("second frame"));
+    }
+
+    #[test]
+    fn nack_reserved_value_ids_still_round_trip() {
+        // Same motivation as reserved_value_dest_and_src_id_still_round_trip_and_scan_correctly:
+        // dest_id/src_id/target_id are plain u8s, nothing stops them from
+        // colliding with a reserved code value.
+        let nack = NackFrame {
+            dest_id: codes::FEC_SOF,
+            src_id: codes::ESCAPE,
+            target_id: [codes::FEC_SCHEME_ID_HI, codes::NACK, codes::ACK],
+        };
+        let frame = build_nack_frame(&nack);
+        let parsed = parse_nack_frame(&frame).unwrap();
+        assert_eq!(parsed, nack);
     }
 }
