@@ -563,10 +563,27 @@ fn frame_wire_length_legacy(wire: &[u8], reader: &mut TokenReader) -> Option<usi
     Some(reader.pos())
 }
 
+/// Distinguishes *why* [`read_protected_header`] couldn't produce a header
+/// -- found live against a real acoustic channel: a header read from a
+/// live-captured buffer that's still growing (the rest of the transmission
+/// hasn't arrived yet) hits the exact same code path as a header that
+/// arrived complete but failed RS correction, and collapsing both into one
+/// "uncorrectable" outcome makes them indistinguishable to a caller. A live
+/// poll loop needs that distinction: "ran out of audio" means wait and
+/// retry once more has arrived; "RS correction failed" means the header
+/// that *did* arrive is genuinely corrupt, safe to report immediately.
+/// Every other region (payload/parity/CRC) already reports its own
+/// "unexpected end of frame..." for this same ambiguity; the header just
+/// hadn't been given one.
+enum HeaderRead {
+    Ok([u8; HEADER_LEN]),
+    Truncated,
+    Uncorrectable,
+}
+
 /// Reads the `HEADER_LEN + HEADER_PARITY_BYTES`-byte protected header block
 /// as logical tokens (resolving escapes, since header byte *values* may
-/// legitimately need it) and RS-corrects it. Returns the corrected 6-byte
-/// header, or `None` if unreadable/uncorrectable.
+/// legitimately need it) and RS-corrects it.
 ///
 /// A `Token::Flag` here means channel corruption broke an escape pair's
 /// *structure* (turned what should have been data into what looks like a
@@ -577,16 +594,22 @@ fn frame_wire_length_legacy(wire: &[u8], reader: &mut TokenReader) -> Option<usi
 /// [`unstuff_bytes`]'s same philosophy for exactly this situation: failing
 /// fast here would make this format's header *less* resilient to this one
 /// corruption pattern than the plain byte-stuffing helper already is.
-fn read_protected_header(reader: &mut TokenReader) -> Option<[u8; HEADER_LEN]> {
+fn read_protected_header(reader: &mut TokenReader) -> HeaderRead {
     let mut header_and_parity = Vec::with_capacity(HEADER_LEN + HEADER_PARITY_BYTES);
     for _ in 0..(HEADER_LEN + HEADER_PARITY_BYTES) {
-        match reader.read().ok()? {
-            Token::Data(v) | Token::Flag(v) => header_and_parity.push(v),
+        match reader.read() {
+            Ok(Token::Data(v) | Token::Flag(v)) => header_and_parity.push(v),
+            Err(_) => return HeaderRead::Truncated,
         }
     }
     let (header_data, header_parity) = header_and_parity.split_at(HEADER_LEN);
-    let corrected = fec::recover(header_data, header_parity, HEADER_PARITY_BYTES)?;
-    corrected.try_into().ok()
+    let Some(corrected) = fec::recover(header_data, header_parity, HEADER_PARITY_BYTES) else {
+        return HeaderRead::Uncorrectable;
+    };
+    match corrected.try_into() {
+        Ok(bytes) => HeaderRead::Ok(bytes),
+        Err(_) => HeaderRead::Uncorrectable,
+    }
 }
 
 fn frame_wire_length_protected(
@@ -594,7 +617,9 @@ fn frame_wire_length_protected(
     reader: &mut TokenReader,
     parity_bytes: usize,
 ) -> Option<usize> {
-    let header = read_protected_header(reader)?;
+    let HeaderRead::Ok(header) = read_protected_header(reader) else {
+        return None;
+    };
     let declared_len = u16::from_be_bytes([header[4], header[5]]) as usize;
 
     let payload_start = reader.pos();
@@ -747,8 +772,12 @@ fn parse_frame_protected(
     my_id: Option<u8>,
     session_key: Option<&[u8; 32]>,
 ) -> ParseResult {
-    let Some(header_bytes) = read_protected_header(reader) else {
-        return ParseResult::fail("protected header FEC uncorrectable");
+    let header_bytes = match read_protected_header(reader) {
+        HeaderRead::Ok(bytes) => bytes,
+        HeaderRead::Truncated => {
+            return ParseResult::fail("unexpected end of frame reading protected header")
+        }
+        HeaderRead::Uncorrectable => return ParseResult::fail("protected header FEC uncorrectable"),
     };
     let header = FrameHeader {
         dest_id: header_bytes[0],
@@ -1170,6 +1199,44 @@ mod tests {
         }
         let result = parse_frame(&frame, fec::DEFAULT_PARITY_BYTES, true, None, None);
         assert!(!result.ok || result.text.as_deref() == Some(text));
+    }
+
+    /// Found live against a real acoustic channel: a live poll scanning a
+    /// still-growing capture buffer can catch a transmission with its
+    /// header genuinely cut short (the rest hasn't arrived yet) -- distinct
+    /// from a header that arrived complete but failed RS correction. Before
+    /// this test existed both cases reported the identical
+    /// "protected header FEC uncorrectable" string, which a live poll loop
+    /// can't safely treat as "wait, more is coming" (it's also the string a
+    /// genuinely corrupt header produces) -- so a header truncated by buffer
+    /// boundaries got reported as a hard failure and permanently skipped,
+    /// even though the same audio, captured in full, decodes cleanly (see
+    /// this repository's README for how this was found).
+    #[test]
+    fn truncated_protected_header_is_reported_distinctly_from_uncorrectable() {
+        let text = "hello protected header";
+        let frame = build_with_format(text, FrameFormat::ProtectedHeader);
+        // Cut the wire short while still inside the header+header-parity
+        // region (right after SOF+SCHEME_ID_LO) -- simulates a live buffer
+        // that hasn't captured the rest of the transmission yet.
+        let truncated = &frame[..frame.len().min(6)];
+        let result = parse_frame(truncated, fec::DEFAULT_PARITY_BYTES, true, None, None);
+        assert!(!result.ok);
+        assert_eq!(result.reason, "unexpected end of frame reading protected header");
+
+        // A genuinely corrupt but *complete* header still reports the
+        // original, distinct "uncorrectable" reason -- this test would be
+        // meaningless if both cases collapsed to the same string again.
+        let mut corrupted = frame.clone();
+        for byte in &mut corrupted[2..16] {
+            *byte ^= 0xFF;
+        }
+        let corrupted_result = parse_frame(&corrupted, fec::DEFAULT_PARITY_BYTES, true, None, None);
+        assert!(!corrupted_result.ok);
+        assert_ne!(
+            corrupted_result.reason,
+            "unexpected end of frame reading protected header"
+        );
     }
 
     #[test]
