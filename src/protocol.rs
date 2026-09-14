@@ -132,6 +132,15 @@ const NACK_PARITY_BYTES: usize = 12;
 /// DEST_ID(1) + SRC_ID(1) + TARGET_ID(3) -- see [`NackFrame`].
 const NACK_HEADER_LEN: usize = 5;
 
+/// Same rationale and budget as [`NACK_PARITY_BYTES`] -- an ack is exactly
+/// as short and exactly as high-value (a sender relies on its *absence* to
+/// decide whether to keep retrying, so a false "never arrived" from weak
+/// protection wastes airtime resending something the other side already
+/// has).
+const ACK_PARITY_BYTES: usize = 12;
+/// DEST_ID(1) + SRC_ID(1) + TARGET_ID(3) -- see [`AckFrame`].
+const ACK_HEADER_LEN: usize = 5;
+
 /// Which wire format [`build_frame`] emits and [`parse_frame`] expects to
 /// auto-detect. See this module's docs for the full rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -303,6 +312,78 @@ fn read_nack_header(reader: &mut TokenReader) -> Option<[u8; NACK_HEADER_LEN]> {
     }
     let (header_data, header_parity) = header_and_parity.split_at(NACK_HEADER_LEN);
     let corrected = fec::recover(header_data, header_parity, NACK_PARITY_BYTES)?;
+    corrected.try_into().ok()
+}
+
+/// Delivery confirmation: "the message identified by `target_id` arrived
+/// and decoded cleanly." Distinct from an ordinary data frame -- recognized
+/// right after SOF via [`codes::ACK`], the same way [`NackFrame`] is via
+/// [`codes::FEC_SCHEME_ID_HI`] -- for the same reasons: cheap to recognize,
+/// fails obviously rather than being misread as a malformed data frame.
+///
+/// A sender that knows to expect one (it just transmitted a message and is
+/// listening) treats *hearing* this as "stop retrying," and its *absence*
+/// within a retry interval as "resend." That works even when the receiver
+/// never decoded anything at all -- unlike [`NackFrame`], which needs the
+/// receiver to already have a `target_id` to ask for, an ack-based sender
+/// doesn't need the receiver to do anything but stay silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AckFrame {
+    pub dest_id: u8,
+    pub src_id: u8,
+    pub target_id: [u8; 3],
+}
+
+/// Builds a delivery-confirmation frame. Always succeeds, same reasoning as
+/// [`build_nack_frame`].
+pub fn build_ack_frame(ack: &AckFrame) -> Vec<u8> {
+    let header_data = [
+        ack.dest_id,
+        ack.src_id,
+        ack.target_id[0],
+        ack.target_id[1],
+        ack.target_id[2],
+    ];
+    let header_parity = fec::protect(&header_data, ACK_PARITY_BYTES);
+
+    let mut frame = vec![codes::FEC_SOF, codes::ACK];
+    frame.extend(stuff(&header_data));
+    frame.extend(stuff(&header_parity));
+    frame
+}
+
+/// Attempts to read an [`AckFrame`] starting at `received[0]`. Same
+/// `None`-collapses-two-cases contract as [`parse_nack_frame`] -- a caller
+/// scanning for acks only cares whether a valid one arrived.
+pub fn parse_ack_frame(received: &[u8]) -> Option<AckFrame> {
+    let mut reader = TokenReader::new(received);
+    match reader.read().ok()? {
+        Token::Flag(v) if v == codes::FEC_SOF => {}
+        _ => return None,
+    }
+    match reader.read().ok()? {
+        Token::Flag(v) if v == codes::ACK => {}
+        _ => return None,
+    }
+    let header = read_ack_header(&mut reader)?;
+    Some(AckFrame {
+        dest_id: header[0],
+        src_id: header[1],
+        target_id: [header[2], header[3], header[4]],
+    })
+}
+
+/// Shared by [`parse_ack_frame`] and [`frame_wire_length`]'s ACK branch --
+/// see [`read_nack_header`], identical structure.
+fn read_ack_header(reader: &mut TokenReader) -> Option<[u8; ACK_HEADER_LEN]> {
+    let mut header_and_parity = Vec::with_capacity(ACK_HEADER_LEN + ACK_PARITY_BYTES);
+    for _ in 0..(ACK_HEADER_LEN + ACK_PARITY_BYTES) {
+        match reader.read().ok()? {
+            Token::Data(v) | Token::Flag(v) => header_and_parity.push(v),
+        }
+    }
+    let (header_data, header_parity) = header_and_parity.split_at(ACK_HEADER_LEN);
+    let corrected = fec::recover(header_data, header_parity, ACK_PARITY_BYTES)?;
     corrected.try_into().ok()
 }
 
@@ -528,6 +609,10 @@ pub fn frame_wire_length(wire: &[u8], start: usize, parity_bytes: usize) -> Opti
         }
         Ok(Token::Flag(v)) if v == codes::FEC_SCHEME_ID_HI => {
             read_nack_header(&mut reader)?;
+            Some(start + reader.pos())
+        }
+        Ok(Token::Flag(v)) if v == codes::ACK => {
+            read_ack_header(&mut reader)?;
             Some(start + reader.pos())
         }
         _ => {
@@ -1706,5 +1791,107 @@ mod tests {
         let frame = build_nack_frame(&nack);
         let parsed = parse_nack_frame(&frame).unwrap();
         assert_eq!(parsed, nack);
+    }
+
+    // --- AckFrame (delivery confirmation) -----------------------------------
+
+    #[test]
+    fn ack_roundtrip() {
+        let ack = AckFrame {
+            dest_id: 7,
+            src_id: 3,
+            target_id: [0xAB, 0xCD, 0xEF],
+        };
+        let frame = build_ack_frame(&ack);
+        let parsed = parse_ack_frame(&frame).unwrap();
+        assert_eq!(parsed, ack);
+    }
+
+    /// An ACK frame must never be misread as an ordinary data frame or a
+    /// NACK frame (or vice versa) -- all three share the same SOF but
+    /// diverge on the very next byte ([`codes::ACK`] vs
+    /// [`codes::FEC_SCHEME_ID_HI`] vs [`codes::FEC_SCHEME_ID_LO`]/anything
+    /// else), so dispatch must route each to its own parser only.
+    #[test]
+    fn ack_frame_is_not_parsed_as_a_data_or_nack_frame_and_vice_versa() {
+        let ack = build_ack_frame(&AckFrame {
+            dest_id: 1,
+            src_id: 2,
+            target_id: [1, 2, 3],
+        });
+        let data_result = parse_frame(&ack, fec::DEFAULT_PARITY_BYTES, true, None, None);
+        assert!(!data_result.ok);
+        assert!(parse_nack_frame(&ack).is_none());
+
+        let data_frame = build("hello");
+        assert!(parse_ack_frame(&data_frame).is_none());
+
+        let nack = build_nack_frame(&NackFrame {
+            dest_id: 1,
+            src_id: 2,
+            target_id: [1, 2, 3],
+        });
+        assert!(parse_ack_frame(&nack).is_none());
+    }
+
+    #[test]
+    fn ack_survives_corruption_within_header_fec_budget() {
+        let ack = AckFrame {
+            dest_id: 42,
+            src_id: 99,
+            target_id: [0x11, 0x22, 0x33],
+        };
+        let mut frame = build_ack_frame(&ack);
+        // 2 corrupted bytes, well within ACK_PARITY_BYTES=12's t=6 budget.
+        frame[2] ^= 0xFF;
+        frame[4] ^= 0xFF;
+        let parsed = parse_ack_frame(&frame).unwrap();
+        assert_eq!(parsed, ack);
+    }
+
+    #[test]
+    fn ack_fails_cleanly_beyond_its_correction_budget() {
+        let ack = AckFrame {
+            dest_id: 42,
+            src_id: 99,
+            target_id: [0x11, 0x22, 0x33],
+        };
+        let mut frame = build_ack_frame(&ack);
+        for byte in &mut frame[2..15] {
+            *byte ^= 0xFF;
+        }
+        let parsed = parse_ack_frame(&frame);
+        assert!(parsed.is_none() || parsed == Some(ack));
+    }
+
+    #[test]
+    fn ack_frame_wire_length_lets_scanning_find_the_next_frame() {
+        let ack = build_ack_frame(&AckFrame {
+            dest_id: 1,
+            src_id: 2,
+            target_id: [9, 9, 9],
+        });
+        let data = build("second frame");
+        let mut both = ack.clone();
+        both.extend(&data);
+
+        let len1 = frame_wire_length(&both, 0, fec::DEFAULT_PARITY_BYTES).unwrap();
+        assert_eq!(len1, ack.len());
+
+        let result2 = parse_frame(&both[len1..], fec::DEFAULT_PARITY_BYTES, true, None, None);
+        assert!(result2.ok, "{result2:?}");
+        assert_eq!(result2.text.as_deref(), Some("second frame"));
+    }
+
+    #[test]
+    fn ack_reserved_value_ids_still_round_trip() {
+        let ack = AckFrame {
+            dest_id: codes::FEC_SOF,
+            src_id: codes::ESCAPE,
+            target_id: [codes::FEC_SCHEME_ID_HI, codes::NACK, codes::ACK],
+        };
+        let frame = build_ack_frame(&ack);
+        let parsed = parse_ack_frame(&frame).unwrap();
+        assert_eq!(parsed, ack);
     }
 }
