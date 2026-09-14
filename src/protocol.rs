@@ -106,21 +106,29 @@ pub const FLAG_ENCRYPTED: u8 = 0b0000_0001;
 pub const FLAG_MORE_FRAMES: u8 = 0b0000_0010; // message continues in a subsequent frame
 
 /// Number of RS parity bytes protecting the 6-byte header in
-/// [`FrameFormat::ProtectedHeader`] frames -- corrects up to 2 corrupted
-/// header bytes (`t = parity/2`). Fixed rather than user-tunable: unlike
-/// payload `--parity-bytes` (where the right tradeoff depends on message
-/// size and channel quality), the header is always exactly 6 bytes, so
-/// there's no analogous per-message tuning question to expose.
-const HEADER_PARITY_BYTES: usize = 4;
+/// [`FrameFormat::ProtectedHeader`] frames -- corrects up to 6 corrupted
+/// header bytes (`t = parity/2`). Originally fixed at 4 (t=2) on the
+/// reasoning that the header's *size* never varies, so there's no
+/// per-message tuning question the way there is for payload
+/// `--parity-bytes`. Real acoustic phone-channel testing (TOVChat, a
+/// browser port of this format) showed that reasoning misses the axis
+/// that actually matters: channel *quality*, not header size. Calibrate
+/// mode lets a caller raise payload `parity_bytes` to survive a noisy
+/// channel, but the header had no equivalent -- so on exactly the noisy
+/// channels calibrate exists for, the header (stuck at t=2) became the
+/// bottleneck and failed before the payload's own (now well-protected)
+/// FEC was ever exercised. Raised to t=6; the header is only 6 bytes, so
+/// even a generous parity budget costs a handful of wire bytes per frame.
+const HEADER_PARITY_BYTES: usize = 12;
 const HEADER_LEN: usize = 6; // DEST_ID(1) + SRC_ID(1) + FLAGS(1) + SEQ(1) + LENGTH(2)
 
 /// RS parity bytes protecting a [`NackFrame`]'s 5-byte header -- same
-/// budget as [`HEADER_PARITY_BYTES`] (t=2 correction), applied to a
+/// budget as [`HEADER_PARITY_BYTES`] (t=6 correction), applied to a
 /// slightly shorter block. A resend request is exactly the kind of short,
 /// high-value control message worth protecting at least as well as an
 /// ordinary frame's header: if it can't survive the channel, the receiver
 /// silently gets no resend instead of a clean failure it could retry.
-const NACK_PARITY_BYTES: usize = 4;
+const NACK_PARITY_BYTES: usize = 12;
 /// DEST_ID(1) + SRC_ID(1) + TARGET_ID(3) -- see [`NackFrame`].
 const NACK_HEADER_LEN: usize = 5;
 
@@ -1116,8 +1124,8 @@ mod tests {
         let text = "hello protected header";
         let mut frame = build_with_format(text, FrameFormat::ProtectedHeader);
         // Corrupt 2 bytes within the header+header-parity region (right
-        // after SOF+SCHEME_ID_LO) -- within HEADER_PARITY_BYTES=4's t=2
-        // correction budget.
+        // after SOF+SCHEME_ID_LO) -- well within HEADER_PARITY_BYTES=12's
+        // t=6 correction budget.
         frame[2] ^= 0xFF;
         frame[4] ^= 0xFF;
         let result = parse_frame(&frame, fec::DEFAULT_PARITY_BYTES, true, None, None);
@@ -1138,7 +1146,7 @@ mod tests {
         )
         .unwrap();
         // Same corruption pattern as the sibling test above -- within the
-        // t=2 budget -- but this time checking that SRC_ID specifically
+        // t=6 budget -- but this time checking that SRC_ID specifically
         // (not just the overall `ok`/text) comes back correct, since a
         // header-wide RS codeword recovering "some" fields right while
         // silently getting SRC_ID wrong would be exactly the kind of
@@ -1156,8 +1164,8 @@ mod tests {
     fn protected_header_fails_cleanly_beyond_its_correction_budget() {
         let text = "hello protected header";
         let mut frame = build_with_format(text, FrameFormat::ProtectedHeader);
-        // Corrupt more header bytes than HEADER_PARITY_BYTES=4 (t=2) can fix.
-        for byte in &mut frame[2..8] {
+        // Corrupt more header bytes than HEADER_PARITY_BYTES=12 (t=6) can fix.
+        for byte in &mut frame[2..16] {
             *byte ^= 0xFF;
         }
         let result = parse_frame(&frame, fec::DEFAULT_PARITY_BYTES, true, None, None);
@@ -1573,8 +1581,8 @@ mod tests {
             target_id: [0x11, 0x22, 0x33],
         };
         let mut frame = build_nack_frame(&nack);
-        // 2 corrupted bytes, within NACK_PARITY_BYTES=4's t=2 budget --
-        // same margin `protected_header_corrects_corrupted_header_bytes`
+        // 2 corrupted bytes, well within NACK_PARITY_BYTES=12's t=6 budget
+        // -- same margin `protected_header_corrects_corrupted_header_bytes`
         // exercises for the ordinary header.
         frame[2] ^= 0xFF;
         frame[4] ^= 0xFF;
@@ -1590,7 +1598,7 @@ mod tests {
             target_id: [0x11, 0x22, 0x33],
         };
         let mut frame = build_nack_frame(&nack);
-        for byte in &mut frame[2..9] {
+        for byte in &mut frame[2..15] {
             *byte ^= 0xFF;
         }
         let parsed = parse_nack_frame(&frame);
